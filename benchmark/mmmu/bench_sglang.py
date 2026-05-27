@@ -98,7 +98,9 @@ async def process_sample(
         image_url = f"data:{mime};base64,{b64}"
     else:
         image_url = image_path
-    extra_body = {"lora_path": lora_path} if lora_path else None
+    extra_body = {"top_k": 20}
+    if lora_path:
+        extra_body["lora_path"] = lora_path
     payload = {
         "model": model,
         "messages": [
@@ -111,9 +113,14 @@ async def process_sample(
                 ],
             }
         ],
+        "max_tokens": 32768,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "presence_penalty": 1.5,
         "extra_body": extra_body,
-        **sampling_params,
     }
+    if sampling_params:
+        payload.update(sampling_params)
     if reasoning_effort:
         payload["reasoning_effort"] = reasoning_effort
     response = await client.chat.completions.create(**payload)
@@ -121,6 +128,10 @@ async def process_sample(
     content = msg.content
     if content is None:
         content = getattr(msg, "reasoning_content", None)
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        sample["_completion_tokens"] = getattr(usage, "completion_tokens", 0)
+        sample["_prompt_tokens"] = getattr(usage, "prompt_tokens", 0)
     return sample, content
 
 
@@ -145,6 +156,9 @@ async def eval_mmmu(args) -> None:
     eval_args = EvalArgs.from_cli_args(args)
     sampling_params = get_sampling_params(eval_args)
     samples = prepare_samples(eval_args)
+    if getattr(args, "num_samples", 0) and args.num_samples > 0:
+        samples = samples[: args.num_samples]
+        print(f"[num-samples] truncated to {len(samples)} samples")
     model = args.model
     reasoning_effort = eval_args.reasoning_effort
     lora_path = eval_args.lora_path
@@ -224,6 +238,20 @@ async def eval_mmmu(args) -> None:
             print("Profiler stopped")
 
     print(f"Benchmark time: {time.perf_counter() - start}")
+    comp_tokens = [s.get("_completion_tokens", 0) for s in samples if "_completion_tokens" in s]
+    prom_tokens = [s.get("_prompt_tokens", 0) for s in samples if "_prompt_tokens" in s]
+    if comp_tokens:
+        comp_tokens_sorted = sorted(comp_tokens)
+        n = len(comp_tokens_sorted)
+        p50 = comp_tokens_sorted[n // 2]
+        p99 = comp_tokens_sorted[min(n - 1, int(n * 0.99))]
+        print(
+            f"[token-stats] n={n} "
+            f"prompt_total={sum(prom_tokens)} "
+            f"completion_total={sum(comp_tokens)} "
+            f"completion_mean={sum(comp_tokens)/n:.1f} "
+            f"completion_p50={p50} completion_p99={p99} completion_max={max(comp_tokens)}"
+        )
     args.output_path = "./answer_sglang.json"
     save_json(args.output_path, out_samples)
     eval_result(
@@ -240,6 +268,12 @@ def parse_args():
         type=str,
         default="default",
         help="Model name to use in API requests.",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=0,
+        help="If >0, truncate samples to this count for a quick run.",
     )
     EvalArgs.add_cli_args(parser)
     args = add_common_sglang_args_and_parse(parser)

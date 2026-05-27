@@ -111,7 +111,7 @@ class ForwardMetadata:
 global_workspace_buffer = None
 
 
-_AITER_PARTITION_SIZE_ROCM = 256
+_AITER_PARTITION_SIZE_ROCM = 128
 
 
 class AiterAttnBackend(AttentionBackend):
