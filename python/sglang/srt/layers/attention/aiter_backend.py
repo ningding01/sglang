@@ -5,6 +5,7 @@ end to end attention solution with aiter kernels
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
@@ -111,7 +112,9 @@ class ForwardMetadata:
 global_workspace_buffer = None
 
 
-_AITER_PARTITION_SIZE_ROCM = 128
+_AITER_PARTITION_SIZE_ROCM = int(
+    os.environ.get("SGLANG_AITER_PARTITION_SIZE", "256")
+)
 
 
 class AiterAttnBackend(AttentionBackend):
