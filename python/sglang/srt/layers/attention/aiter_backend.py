@@ -230,9 +230,13 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         # aiter kernel related initialization
+        # head_dim=256 (Qwen3.5 MoE) safely uses the 128 token-partition (LDS/occupancy
+        # win); head_dim=128 (e.g. Qwen3-32B dense) must use 256, otherwise the aiter
+        # paged-attention kernel corrupts state and collapses output at bs=1.
+        self.partition_size = 128 if self.head_dim == 256 else 256
         self.max_num_partitions = (
-            self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
-        ) // _AITER_PARTITION_SIZE_ROCM
+            self.max_context_len + self.partition_size - 1
+        ) // self.partition_size
 
         nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
 
@@ -2953,7 +2957,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.k_scale,
                     self.v_scale,
                     None,
-                    _AITER_PARTITION_SIZE_ROCM,
+                    self.partition_size,
                 )
 
         return o
