@@ -9,7 +9,7 @@ import logging
 import jinja2
 import transformers.utils.chat_template_utils as hf_chat_utils
 
-from sglang.srt.utils import ImageData
+from sglang.srt.utils import ImageData, VideoData
 
 logger = logging.getLogger(__name__)
 
@@ -177,17 +177,22 @@ def process_content_for_template_format(
                     processed_content_parts.append({"type": "image"})
                 elif chunk_type == "video_url":
                     video_obj = chunk.get("video_url") or {}
-                    mdp = video_obj.get("max_dynamic_patch", None)
-                    if mdp is None:
-                        video_data.append(chunk["video_url"]["url"])
-                    else:
-                        # Keep structured info for backend, but template only sees {"type":"video"}
-                        video_data.append(
-                            {
-                                "url": video_obj["url"],
-                                "max_dynamic_patch": mdp,
-                            }
+                    preprocess_kwargs = {
+                        key: value
+                        for key in (
+                            "fps",
+                            "detail",
+                            "max_long_side_pixel",
+                            "max_dynamic_patch",
                         )
+                        if (value := video_obj.get(key)) is not None
+                    }
+                    video_data.append(
+                        VideoData(
+                            url=video_obj["url"],
+                            preprocess_kwargs=preprocess_kwargs or None,
+                        )
+                    )
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'video' type for template compatibility

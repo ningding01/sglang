@@ -24,7 +24,11 @@
 #include <sgl_kernel/warp.cuh>
 
 #include <cfloat>
+#ifdef USE_ROCM
+#include <hip/hip_cooperative_groups.h>
+#else
 #include <cooperative_groups.h>
+#endif
 #include <cstdint>
 #include <limits>
 
@@ -134,17 +138,33 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
   return 0.5f * (to_val(key) + to_val(key - 1));
 }
 
+using WarpMask = decltype(kFullMask);
+
+SGL_DEVICE WarpMask logical_warp_mask(WarpMask lane_mask = WarpMask{0xFFFFFFFFu}) {
+#ifdef USE_ROCM
+  return lane_mask << ((threadIdx.x & kWarpSize) ? kWarpSize : 0);
+#else
+  return lane_mask;
+#endif
+}
+
 SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
+  const auto mask = logical_warp_mask();
 #pragma unroll
   for (uint32_t offset = 1; offset < 32; offset *= 2) {
-    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
+    uint32_t n = __shfl_up_sync(mask, val, offset, kWarpSize);
     if (lane_id >= offset) val += n;
   }
   return val;
 }
 
-SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
-  return __popc(__ballot_sync(mask, pred));
+SGL_DEVICE uint32_t warp_sum_bool(bool pred, WarpMask mask = WarpMask{0xFFFFFFFFu}) {
+  const auto active_mask = logical_warp_mask(mask);
+#ifdef USE_ROCM
+  return __popcll(__ballot_sync(active_mask, pred) & active_mask);
+#else
+  return __popc(__ballot_sync(active_mask, pred));
+#endif
 }
 
 struct alignas(8) TieValue {
@@ -253,7 +273,7 @@ struct TopKConfig {
     } else if (num_ties <= kWarpSize) {
       if (lane_id >= num_ties || warp_id >= num_ties) return;  // some threads are idle
       /// NOTE: use long long to avoid mask overflow when num_tie == 32
-      const uint32_t mask = (1ull << num_ties) - 1u;
+      const WarpMask mask = (WarpMask{1} << num_ties) - WarpMask{1};
       const auto tie = tie_buffer[lane_id];
       const auto target = tie_buffer[warp_id];
       const auto rank = warp_sum_bool(is_greater(tie, target), mask);
@@ -695,6 +715,7 @@ struct TopKStreaming : TopKRegister<2> {
 // on one batch element via distributed shared memory (one cluster per element).
 // ---------------------------------------------------------------------------
 
+#ifndef USE_ROCM
 template <uint32_t kClusterSize_>
 struct TopKCluster : TopKRadixBase<10> {
  public:
@@ -838,5 +859,6 @@ struct TopKCluster : TopKRadixBase<10> {
     }
   }
 };
+#endif
 
 }  // namespace device::topk

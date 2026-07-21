@@ -683,7 +683,15 @@ def generate_chat_conv(
                         )
                     elif content.type == "video_url":
                         real_content += video_token
-                        conv.append_video(content.video_url.url)
+                        video_kwargs = {
+                            key: value
+                            for key in ("fps", "detail", "max_long_side_pixel")
+                            if (value := getattr(content.video_url, key, None)) is not None
+                        }
+                        conv.append_video(
+                            content.video_url.url,
+                            preprocess_kwargs=video_kwargs or None,
+                        )
                     elif content.type == "audio_url":
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)

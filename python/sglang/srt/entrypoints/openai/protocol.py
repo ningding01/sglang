@@ -501,6 +501,9 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    fps: Optional[float] = None
+    detail: Optional[Literal["low", "default", "high"]] = None
+    max_long_side_pixel: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
