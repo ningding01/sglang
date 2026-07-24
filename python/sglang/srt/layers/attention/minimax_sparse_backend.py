@@ -25,6 +25,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def build_minimax_linear_verify_rows(
+    req_pool_indices: torch.Tensor,
+    prefix_seq_lens: torch.Tensor,
+    draft_token_num: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand a topk=1 verify chain into request-major decode rows."""
+    if draft_token_num <= 0:
+        raise ValueError(f"draft_token_num must be positive, got {draft_token_num}")
+    if req_pool_indices.shape != prefix_seq_lens.shape:
+        raise ValueError(
+            "req_pool_indices and prefix_seq_lens must have the same shape, got "
+            f"{req_pool_indices.shape} and {prefix_seq_lens.shape}"
+        )
+
+    batch_size = prefix_seq_lens.shape[0]
+    row_req_pool_indices = req_pool_indices.repeat_interleave(draft_token_num)
+    local_query_offsets = torch.arange(
+        1,
+        draft_token_num + 1,
+        dtype=prefix_seq_lens.dtype,
+        device=prefix_seq_lens.device,
+    ).repeat(batch_size)
+    row_seq_lens = prefix_seq_lens.repeat_interleave(
+        draft_token_num
+    ) + local_query_offsets
+    return row_req_pool_indices, row_seq_lens
+
+
 class MiniMaxSparseAttnBackend(AttentionBackend):
     def __init__(self, runner: ModelRunner):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
@@ -96,6 +124,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Per-forward MSA decode metadata (page table + fmha plan), shared by every
         # sparse layer of a forward; (re)built in init_forward_metadata_out_graph.
         self._msa_dec_meta = None
+        self._verify_row_req_pool_indices = None
+        self._verify_row_seq_lens = None
         if self.use_msa:
             from sglang.srt.layers.dp_attention import get_attention_tp_size
 
@@ -214,6 +244,25 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._max_seqlen_q = 1
         if in_capture and forward_batch.forward_mode.is_decode_or_idle():
             self._max_seqlen_k = self.max_context_len
+        elif forward_batch.forward_mode.is_target_verify():
+            verify_input = forward_batch.spec_info
+            if verify_input.topk != 1:
+                raise NotImplementedError(
+                    "MiniMax-M3 sparse attention currently supports EAGLE target "
+                    "verification only with speculative_eagle_topk=1."
+                )
+            self._max_seqlen_k = int(
+                forward_batch.seq_lens_cpu.max().item()
+                + verify_input.draft_token_num
+            )
+            (
+                self._verify_row_req_pool_indices,
+                self._verify_row_seq_lens,
+            ) = build_minimax_linear_verify_rows(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                verify_input.draft_token_num,
+            )
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
 
@@ -353,6 +402,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
+        if forward_batch.forward_mode.is_target_verify():
+            return self._forward_target_verify(
+                q,
+                k_cache,
+                v_cache,
+                idx_q,
+                idx_k_cache,
+                idx_v_cache,
+                forward_batch,
+                disable_value,
+            )
+
         cu_seqlens = torch.cat(
             [
                 torch.zeros(
@@ -451,6 +512,59 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 else idx_o.reshape(original_num_tokens, -1).contiguous()
             ),
             o.reshape(original_num_tokens, -1).contiguous(),
+        )
+
+    def _forward_target_verify(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        disable_value: bool,
+    ):
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        batch_size = forward_batch.seq_lens.shape[0]
+        expected_num_tokens = batch_size * draft_token_num
+        if q.shape[0] != expected_num_tokens:
+            raise RuntimeError(
+                "MiniMax-M3 target verify expects a uniform request-major token "
+                f"layout: {q.shape[0]} != {batch_size} * {draft_token_num}"
+            )
+
+        row_req_pool_indices = self._verify_row_req_pool_indices
+        row_seq_lens = self._verify_row_seq_lens
+        if row_req_pool_indices is None or row_seq_lens is None:
+            raise RuntimeError("MiniMax-M3 target verify metadata was not initialized")
+
+        idx_o, o = minimax_sparse_decode(
+            q,
+            None,
+            k_cache,
+            v_cache,
+            idx_q,
+            None,
+            idx_k_cache,
+            idx_v_cache,
+            self.req_to_token,
+            row_req_pool_indices,
+            row_seq_lens,
+            self._max_seqlen_k,
+            1,
+            self.block_size_k,
+            self.topk_blocks,
+            self.init_blocks,
+            self.local_blocks,
+            score_type=self.score_type,
+            disable_index_value=disable_value,
+            page_size=self.page_size,
+            use_msa=False,
+        )
+        return (
+            None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
+            o.reshape(q.shape[0], -1).contiguous(),
         )
 
     def _dense_sparse_main_decode(

@@ -1538,6 +1538,21 @@ class MiniMaxM3Model(nn.Module):
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
+    def set_eagle3_layers_to_capture(
+        self, layer_ids: Optional[list[int]] = None
+    ) -> None:
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", False)
+
+        if layer_ids is None:
+            num_layers = len(self.layers)
+            self.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.layers_to_capture = [layer_id + 1 for layer_id in layer_ids]
+
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1699,15 +1714,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             return
 
         self.capture_aux_hidden_states = True
-        if layer_ids is None:
-            num_layers = self.config.num_hidden_layers
-            self.model.layers_to_capture = [
-                2,
-                num_layers // 2,
-                num_layers - 3,
-            ]  # Specific layers for EAGLE3 support
-        else:
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        self.model.set_eagle3_layers_to_capture(layer_ids)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

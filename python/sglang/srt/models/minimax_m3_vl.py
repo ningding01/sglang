@@ -145,6 +145,17 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         )
 
         self.logits_processor = LogitsProcessor(text_config)
+        self.capture_aux_hidden_states = False
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        self.model.set_eagle3_layers_to_capture(layer_ids)
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
 
     def _determine_num_fused_shared_experts(self) -> None:
         text_config = self.config.text_config
@@ -239,12 +250,17 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank and not get_embedding:
             return self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
+                aux_hidden_states,
             )
         return hidden_states
 

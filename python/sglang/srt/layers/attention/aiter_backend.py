@@ -1028,6 +1028,17 @@ class AiterAttnBackend(AttentionBackend):
                     max_q_len = 1
                     qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
                     kv_indptr = None
+                elif self.kv_cache_is_vectorized_5d and not self.use_mla:
+                    # EAGLE draft decode still needs its ragged token indices,
+                    # while shuffled-5D unified attention additionally consumes
+                    # a physical page table.
+                    kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+                    bs = kv_indptr.shape[0] - 1
+                    decode_page_table_5d, swa_page_table = (
+                        self._build_unified_page_table_from_spec(spec_info, bs)
+                    )
+                    max_q_len = 1
+                    qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
                 else:
                     kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                     bs = kv_indptr.shape[0] - 1
