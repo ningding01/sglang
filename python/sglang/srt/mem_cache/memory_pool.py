@@ -1224,6 +1224,7 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        kv_cache_layout: Optional[str] = None,
     ):
         super().__init__(
             size,
@@ -1271,7 +1272,11 @@ class MHATokenToKVPool(KVCache):
         else:
             self.kv_cache_layout = "nhd"
             if _use_aiter:
-                layout = envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower()
+                layout = (
+                    kv_cache_layout
+                    if kv_cache_layout is not None
+                    else envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower()
+                )
                 if layout not in ("nhd", "vectorized_5d"):
                     raise ValueError(
                         f"Unsupported SGLANG_AITER_KV_CACHE_LAYOUT={layout!r}; "

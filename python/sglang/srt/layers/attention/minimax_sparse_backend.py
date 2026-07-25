@@ -126,6 +126,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._msa_dec_meta = None
         self._verify_row_req_pool_indices = None
         self._verify_row_seq_lens = None
+        self._cuda_graph_verify_row_req_pool_indices = None
+        self._cuda_graph_verify_row_seq_lens = None
+        self._cuda_graph_verify_local_offsets = None
         if self.use_msa:
             from sglang.srt.layers.dp_attention import get_attention_tp_size
 
@@ -242,7 +245,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._max_seqlen_q = int(max(extend_lens))
         else:
             self._max_seqlen_q = 1
-        if in_capture and forward_batch.forward_mode.is_decode_or_idle():
+        if in_capture and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             self._max_seqlen_k = self.max_context_len
         elif forward_batch.forward_mode.is_target_verify():
             verify_input = forward_batch.spec_info
@@ -255,16 +261,39 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_cpu.max().item()
                 + verify_input.draft_token_num
             )
-            (
-                self._verify_row_req_pool_indices,
-                self._verify_row_seq_lens,
-            ) = build_minimax_linear_verify_rows(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                verify_input.draft_token_num,
-            )
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+
+        if forward_batch.forward_mode.is_target_verify():
+            verify_input = forward_batch.spec_info
+            if verify_input.topk != 1:
+                raise NotImplementedError(
+                    "MiniMax-M3 sparse attention currently supports EAGLE target "
+                    "verification only with speculative_eagle_topk=1."
+                )
+            num_rows = forward_batch.seq_lens.shape[0] * verify_input.draft_token_num
+            if self._cuda_graph_verify_row_req_pool_indices is None:
+                (
+                    self._verify_row_req_pool_indices,
+                    self._verify_row_seq_lens,
+                ) = build_minimax_linear_verify_rows(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    verify_input.draft_token_num,
+                )
+            else:
+                if num_rows > self._cuda_graph_verify_row_req_pool_indices.shape[0]:
+                    raise RuntimeError(
+                        "MiniMax-M3 target verify rows exceed CUDA graph capacity: "
+                        f"{num_rows} > "
+                        f"{self._cuda_graph_verify_row_req_pool_indices.shape[0]}"
+                    )
+                self._verify_row_req_pool_indices = (
+                    self._cuda_graph_verify_row_req_pool_indices[:num_rows]
+                )
+                self._verify_row_seq_lens = self._cuda_graph_verify_row_seq_lens[
+                    :num_rows
+                ]
 
         # Build the MSA decode plan + page table here (eager, outside graph capture)
         # so forward_decode — captured into the graph — only runs device-side ops.
@@ -314,10 +343,41 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._msa_dec_meta = (kv_indices_buf, plan)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        pass
+        if not forward_batch.forward_mode.is_target_verify():
+            return
+        if self._cuda_graph_verify_row_req_pool_indices is None:
+            return
+
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        batch_size = forward_batch.seq_lens.shape[0]
+        num_rows = batch_size * draft_token_num
+        req_rows = self._cuda_graph_verify_row_req_pool_indices[:num_rows].view(
+            batch_size, draft_token_num
+        )
+        seq_rows = self._cuda_graph_verify_row_seq_lens[:num_rows].view(
+            batch_size, draft_token_num
+        )
+        req_rows.copy_(forward_batch.req_pool_indices[:, None])
+        seq_rows.copy_(
+            forward_batch.seq_lens[:, None]
+            + self._cuda_graph_verify_local_offsets[:draft_token_num][None, :]
+        )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        pass
+        device = self.req_to_token.device
+        self._cuda_graph_verify_row_req_pool_indices = torch.zeros(
+            max_num_tokens, dtype=torch.int64, device=device
+        )
+        self._cuda_graph_verify_row_seq_lens = torch.zeros(
+            max_num_tokens, dtype=torch.int64, device=device
+        )
+        num_tokens_per_bs = max_num_tokens // max_bs
+        self._cuda_graph_verify_local_offsets = torch.arange(
+            1,
+            num_tokens_per_bs + 1,
+            dtype=torch.int64,
+            device=device,
+        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1

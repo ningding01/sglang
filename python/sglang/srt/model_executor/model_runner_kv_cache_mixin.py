@@ -839,6 +839,10 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        # SHUFFLE/vectorized-5D is a MiniMax target optimization.
+                        # EAGLE draft uses AITER's standard paged layout, which is
+                        # CUDA-graph safe for the multi-step draft backend.
+                        kv_cache_layout="nhd" if self.is_draft_worker else None,
                     )
 
         # Initialize token_to_kv_pool_allocator
