@@ -58,9 +58,13 @@ def _gqa_share_sparse_decode_kernel(
     stride_k_s,
     stride_k_h,
     stride_k_d,
+    stride_k_p,
+    stride_k_x,
     stride_v_s,
     stride_v_h,
     stride_v_d,
+    stride_v_p,
+    stride_v_x,
     stride_r2t_b,
     stride_ti_h,
     stride_ti_b,
@@ -81,6 +85,9 @@ def _gqa_share_sparse_decode_kernel(
     NUM_TOPK_CHUNKS: tl.constexpr,
     HAS_SINK: tl.constexpr,
     IS_FP8: tl.constexpr,
+    IS_SHUFFLE_5D: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    VEC_X: tl.constexpr,
 ):
     # decode program ids: split-K over the topk dimension to give every SM
     # something to do at small batch. pid(0) folds (batch, chunk) together so
@@ -167,11 +174,28 @@ def _gqa_share_sparse_decode_kernel(
         ).to(tl.int64)
         slots = (slots + max_slots) % max_slots  # safety against negative
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
-        k_off = (
-            slots[None, :] * stride_k_s
-            + pid_kh * stride_k_h
-            + off_d[:, None] * stride_k_d
-        )
+        if IS_SHUFFLE_5D:
+            # SHUFFLE-5D K: (num_blocks, H, head_dim // X, page, X). Resolve the
+            # absolute slot into (page block, in-page offset) and the head dim
+            # into (hi, lo) halves of the X-wide inner vector. Reading the pool
+            # in place is what lets the caller skip materializing it as NHD.
+            blk = slots // PAGE_SIZE
+            off_p = slots % PAGE_SIZE
+            d_hi = off_d // VEC_X
+            d_lo = off_d % VEC_X
+            k_off = (
+                blk[None, :] * stride_k_s
+                + pid_kh * stride_k_h
+                + d_hi[:, None] * stride_k_d
+                + off_p[None, :] * stride_k_p
+                + d_lo[:, None] * stride_k_x
+            )
+        else:
+            k_off = (
+                slots[None, :] * stride_k_s
+                + pid_kh * stride_k_h
+                + off_d[:, None] * stride_k_d
+            )
         k = tl.load(
             k_cache_ptr + k_off,
             mask=dim_mask[:, None] & pos_mask[None, :],
@@ -184,11 +208,27 @@ def _gqa_share_sparse_decode_kernel(
             # is bf16 (IS_FP8 False -> this branch is compiled out).
             k = k.to(q.dtype)
         # load V as (BLOCK_SIZE_N, head_dim) via indirect addressing
-        v_off = (
-            slots[:, None] * stride_v_s
-            + pid_kh * stride_v_h
-            + off_d[None, :] * stride_v_d
-        )
+        if IS_SHUFFLE_5D:
+            # SHUFFLE-5D V: (num_blocks, H, page // X, head_dim, X) — here it is
+            # the in-page offset that splits across the X-wide inner vector,
+            # while head_dim stays contiguous (mirror image of the K layout).
+            blk_v = slots // PAGE_SIZE
+            off_pv = slots % PAGE_SIZE
+            p_hi = off_pv // VEC_X
+            p_lo = off_pv % VEC_X
+            v_off = (
+                blk_v[:, None] * stride_v_s
+                + pid_kh * stride_v_h
+                + p_hi[:, None] * stride_v_p
+                + off_d[None, :] * stride_v_d
+                + p_lo[:, None] * stride_v_x
+            )
+        else:
+            v_off = (
+                slots[:, None] * stride_v_s
+                + pid_kh * stride_v_h
+                + off_d[None, :] * stride_v_d
+            )
         v = tl.load(
             v_cache_ptr + v_off,
             mask=pos_mask[:, None] & dim_mask[None, :],
@@ -313,7 +353,33 @@ def flash_decode_with_gqa_share_sparse(
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
     # shape
     batch_size, num_q_heads, head_dim = q.shape
-    max_slots, num_kv_heads, _ = k_cache.shape
+    # SHUFFLE-5D pools are read in place (see the IS_SHUFFLE_5D branches in the
+    # kernel) instead of being gathered into an NHD copy first, which used to
+    # cost a full-pool materialization per sparse layer per decode step.
+    #   K: (num_blocks, H, head_dim // X, page, X)
+    #   V: (num_blocks, H, page // X, head_dim, X)
+    is_shuffle_5d = k_cache.dim() == 5
+    if is_shuffle_5d:
+        num_blocks, num_kv_heads, _kd, page_size, vec_x = k_cache.shape
+        assert v_cache.shape[0] == num_blocks and v_cache.shape[1] == num_kv_heads
+        assert v_cache.shape[2] * vec_x == page_size and v_cache.shape[4] == vec_x
+        assert _kd * vec_x == head_dim, (
+            f"5D K head_dim mismatch: {_kd} * {vec_x} != {head_dim}"
+        )
+        max_slots = num_blocks * page_size
+        k_strides = (
+            k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+            k_cache.stride(3), k_cache.stride(4),
+        )
+        v_strides = (
+            v_cache.stride(0), v_cache.stride(1), v_cache.stride(3),
+            v_cache.stride(2), v_cache.stride(4),
+        )
+    else:
+        max_slots, num_kv_heads, _ = k_cache.shape
+        page_size, vec_x = 1, 1
+        k_strides = (k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), 0, 0)
+        v_strides = (v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), 0, 0)
     assert slot_ids.shape[0] == batch_size and seq_lens.shape[0] == batch_size
     assert topk_idx.shape[0] == num_kv_heads
     assert (
@@ -380,12 +446,8 @@ def flash_decode_with_gqa_share_sparse(
         q.stride(2),
         sink.stride(0) if sink is not None else 0,
         sink.stride(1) if sink is not None else 0,
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        v_cache.stride(2),
+        *k_strides,
+        *v_strides,
         req_to_token.stride(0),
         topk_idx.stride(0),
         topk_idx.stride(1),
@@ -400,6 +462,9 @@ def flash_decode_with_gqa_share_sparse(
         BLOCK_SIZE_N=block_size,
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,
+        IS_SHUFFLE_5D=is_shuffle_5d,
+        PAGE_SIZE=page_size,
+        VEC_X=vec_x,
     )
     # merge partials into chunk 0
     merge_grid = (batch_size, num_q_heads)

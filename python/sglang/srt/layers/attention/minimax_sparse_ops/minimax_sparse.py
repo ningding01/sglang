@@ -290,20 +290,26 @@ def minimax_sparse_decode(
                 topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
             )
         # Step 3: Sparse attention using topk index (main head). Decode stays on
-        # SGLang's Triton sparse path; when the main cache is vectorized_5d (for
-        # the prefill Gluon path) gather it back to NHD so that kernel can read it.
-        if use_atom_env and k_cache.dim() == 5:
-            from sglang.srt.layers.attention.utils import (
-                launch_gather_shuffle_5d_to_linear,
-            )
-
-            total_slots = k_cache.shape[0] * k_cache.shape[3]
-            all_slots = torch.arange(total_slots, dtype=torch.int64, device=q.device)
-            k_cache, v_cache = launch_gather_shuffle_5d_to_linear(
-                k_cache, v_cache, all_slots
-            )
-
+        # SGLang's Triton sparse path, which reads a vectorized_5d main cache in
+        # place. It used to gather the *entire* pool back to NHD here on every
+        # sparse layer of every decode step — a batch-independent O(pool) cost
+        # (~770 MB x 57 layers per step at a 1.5M-token pool) that dominated
+        # decode and made 5D ~8x slower than nhd.
         if use_msa and sink is None:
+            if k_cache.dim() == 5:
+                # msa_sparse_decode_main has no 5D reader yet; keep the gather
+                # confined to that path rather than silently mis-reading.
+                from sglang.srt.layers.attention.utils import (
+                    launch_gather_shuffle_5d_to_linear,
+                )
+
+                total_slots = k_cache.shape[0] * k_cache.shape[3]
+                all_slots = torch.arange(
+                    total_slots, dtype=torch.int64, device=q.device
+                )
+                k_cache, v_cache = launch_gather_shuffle_5d_to_linear(
+                    k_cache, v_cache, all_slots
+                )
             from .msa import msa_sparse_decode_main
 
             o = msa_sparse_decode_main(
