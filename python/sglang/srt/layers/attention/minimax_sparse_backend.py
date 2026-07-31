@@ -479,6 +479,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_v_cache,
                 forward_batch,
                 disable_value,
+                layer.layer_id,
             )
 
         cu_seqlens = torch.cat(
@@ -591,6 +592,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_v_cache: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
         disable_value: bool,
+        layer_id: int,
     ):
         draft_token_num = forward_batch.spec_info.draft_token_num
         batch_size = forward_batch.seq_lens.shape[0]
@@ -617,8 +619,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         cached_topk_idx = None
         want_topk = False
         if use_index_cache:
-            group = self._topk_group_of_layer[layer.layer_id]
-            if self._topk_is_source[layer.layer_id]:
+            group = self._topk_group_of_layer[layer_id]
+            if self._topk_is_source[layer_id]:
                 want_topk = True
             else:
                 cached_topk_idx = self._verify_topk_cache.get(group)
