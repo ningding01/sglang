@@ -238,7 +238,18 @@ def minimax_sparse_decode(
         torch.Tensor
     ] = None,  # per-forward MSA page table (cached)
     msa_plan=None,  # per-forward MSA fmha_sm100 plan (cached)
+    cached_topk_idx: Optional[torch.Tensor] = None,
+    return_topk_idx: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Index cache on the decode side mirrors the prefill one (see
+    :func:`minimax_sparse_prefill`): a group's source layer computes the reduced
+    top-k and the rest reuse it, so the indexer runs once per ``index_topk_freq``
+    sparse layers instead of every layer.
+
+    Only wired for the non-``dense_main_attn_fn`` path (EAGLE target verify).
+    The fused dense path needs ``real_seq_lens`` alongside the page table, which
+    the cache does not carry, so it always recomputes.
+    """
     use_atom_env = False
     try:
         from sglang.srt.environ import envs
@@ -253,6 +264,27 @@ def minimax_sparse_decode(
         idx_k_cache = vectorized_5d_index_cache_to_nhd(idx_k_cache)
         if idx_v_cache is not None and idx_v_cache.dim() == 5:
             idx_v_cache = vectorized_5d_index_cache_to_nhd(idx_v_cache)
+
+    # Index cache hit: skip Step 1 (flash-index attention + top-k) and Step 2
+    # (reduce) entirely, reusing a prior sparse layer's reduced top-k. Only the
+    # non-dense path can do this -- the dense path also needs real_seq_lens.
+    if cached_topk_idx is not None and dense_main_attn_fn is None:
+        o = _sparse_decode_main(
+            q=q,
+            sink=sink,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            topk_idx=cached_topk_idx,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            seq_lens=seq_lens,
+            block_size_k=block_size_k,
+            sm_scale=sm_scale,
+            use_msa=use_msa,
+            msa_kv_indices=msa_kv_indices,
+            msa_plan=msa_plan,
+        )
+        return (None, o, cached_topk_idx) if return_topk_idx else (None, o)
 
     # Step 1: Flash decode with topk index (using index head). When the dense main
     # attention is used, the indexer emits the page table directly (fused
@@ -289,53 +321,87 @@ def minimax_sparse_decode(
             topk_idx = topk_index_reduce(
                 topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
             )
-        # Step 3: Sparse attention using topk index (main head). Decode stays on
-        # SGLang's Triton sparse path, which reads a vectorized_5d main cache in
-        # place. It used to gather the *entire* pool back to NHD here on every
-        # sparse layer of every decode step — a batch-independent O(pool) cost
-        # (~770 MB x 57 layers per step at a 1.5M-token pool) that dominated
-        # decode and made 5D ~8x slower than nhd.
-        if use_msa and sink is None:
-            if k_cache.dim() == 5:
-                # msa_sparse_decode_main has no 5D reader yet; keep the gather
-                # confined to that path rather than silently mis-reading.
-                from sglang.srt.layers.attention.utils import (
-                    launch_gather_shuffle_5d_to_linear,
-                )
-
-                total_slots = k_cache.shape[0] * k_cache.shape[3]
-                all_slots = torch.arange(
-                    total_slots, dtype=torch.int64, device=q.device
-                )
-                k_cache, v_cache = launch_gather_shuffle_5d_to_linear(
-                    k_cache, v_cache, all_slots
-                )
-            from .msa import msa_sparse_decode_main
-
-            o = msa_sparse_decode_main(
-                q=q,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                topk_idx=topk_idx,
-                req_to_token=req_to_token,
-                slot_ids=slot_ids,
-                seq_lens=seq_lens,
-                block_size_k=block_size_k,
-                sm_scale=sm_scale,
-                kv_indices=msa_kv_indices,
-                plan=msa_plan,
-            )
-        else:
-            o = flash_decode_with_gqa_share_sparse(
-                q=q,
-                sink=sink,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                req_to_token=req_to_token,
-                seq_lens=seq_lens,
-                slot_ids=slot_ids,
-                block_size=block_size_k,
-                topk_idx=topk_idx,
-                sm_scale=sm_scale,
-            )
+        o = _sparse_decode_main(
+            q=q,
+            sink=sink,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            topk_idx=topk_idx,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            seq_lens=seq_lens,
+            block_size_k=block_size_k,
+            sm_scale=sm_scale,
+            use_msa=use_msa,
+            msa_kv_indices=msa_kv_indices,
+            msa_plan=msa_plan,
+        )
+        if return_topk_idx:
+            return idx_o, o, topk_idx
     return idx_o, o
+
+
+def _sparse_decode_main(
+    q,
+    sink,
+    k_cache,
+    v_cache,
+    topk_idx,
+    req_to_token,
+    slot_ids,
+    seq_lens,
+    block_size_k,
+    sm_scale,
+    use_msa,
+    msa_kv_indices,
+    msa_plan,
+):
+    """Step 3 of decode: sparse attention over the selected top-k blocks.
+
+    Split out so the index-cache hit path can reuse it without re-running the
+    indexer. Decode stays on SGLang's Triton sparse path, which reads a
+    vectorized_5d main cache in place. It used to gather the *entire* pool back
+    to NHD here on every sparse layer of every decode step — a batch-independent
+    O(pool) cost (~770 MB x 57 layers per step at a 1.5M-token pool) that
+    dominated decode and made 5D ~8x slower than nhd.
+    """
+    if use_msa and sink is None:
+        if k_cache.dim() == 5:
+            # msa_sparse_decode_main has no 5D reader yet; keep the gather
+            # confined to that path rather than silently mis-reading.
+            from sglang.srt.layers.attention.utils import (
+                launch_gather_shuffle_5d_to_linear,
+            )
+
+            total_slots = k_cache.shape[0] * k_cache.shape[3]
+            all_slots = torch.arange(total_slots, dtype=torch.int64, device=q.device)
+            k_cache, v_cache = launch_gather_shuffle_5d_to_linear(
+                k_cache, v_cache, all_slots
+            )
+        from .msa import msa_sparse_decode_main
+
+        return msa_sparse_decode_main(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            topk_idx=topk_idx,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            seq_lens=seq_lens,
+            block_size_k=block_size_k,
+            sm_scale=sm_scale,
+            kv_indices=msa_kv_indices,
+            plan=msa_plan,
+        )
+    return flash_decode_with_gqa_share_sparse(
+        q=q,
+        sink=sink,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        req_to_token=req_to_token,
+        seq_lens=seq_lens,
+        slot_ids=slot_ids,
+        block_size=block_size_k,
+        topk_idx=topk_idx,
+        sm_scale=sm_scale,
+    )

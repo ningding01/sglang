@@ -217,6 +217,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._topk_is_source[lid] = (ordinal % self.index_topk_freq) == 0
         # Per-forward cache {group_key: reduced_topk_idx}; cleared each forward.
         self._topk_cache: dict = {}
+        # Separate from _topk_cache: verify's top-k is shaped over
+        # batch * draft_token_num rows, so it must never be mixed with a
+        # prefill-shaped entry for the same group.
+        self._verify_topk_cache: dict = {}
 
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
@@ -237,9 +241,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
         # New forward -> invalidate the cached per-forward MSA decode metadata.
         self._msa_dec_meta = None
-        # New forward -> drop the per-forward index-cache top-k (prefill only).
+        # New forward -> drop the per-forward index-cache top-k (prefill + verify).
         if self.index_cache_enabled:
             self._topk_cache = {}
+            self._verify_topk_cache = {}
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
@@ -394,8 +399,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         When True, the layer never runs the indexer (no flash-index attention,
         no top-k), so its index Q/K norm+rope is dead work the model can skip.
-        Only valid for disable_value layers (idx_o is None there). Prefill-only:
-        decode always computes its own top-k, so callers must gate on is_extend.
+        Only valid for disable_value layers (idx_o is None there). Applies to
+        prefill and to EAGLE target verify; plain decode still computes its own
+        top-k because its fused dense path also needs real_seq_lens, which the
+        cache does not carry.
         """
         return (
             self.index_cache_enabled
@@ -599,7 +606,24 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         if row_req_pool_indices is None or row_seq_lens is None:
             raise RuntimeError("MiniMax-M3 target verify metadata was not initialized")
 
-        idx_o, o = minimax_sparse_decode(
+        # Index cache on the verify path. Verify runs the indexer over
+        # batch * draft_token_num rows, so it is where the per-layer indexer cost
+        # hurts most: profiling EAGLE3 steps=3 at 75K showed it as the largest
+        # decode-side amplifier (2.39x vs plain decode, the worst of any
+        # decode-only kernel). Sharing one group's reduced top-k across its
+        # sparse layers cuts that by index_topk_freq. Same approximation the
+        # prefill path already ships, and the same one ATOM applies to decode.
+        use_index_cache = self.index_cache_enabled and disable_value
+        cached_topk_idx = None
+        want_topk = False
+        if use_index_cache:
+            group = self._topk_group_of_layer[layer.layer_id]
+            if self._topk_is_source[layer.layer_id]:
+                want_topk = True
+            else:
+                cached_topk_idx = self._verify_topk_cache.get(group)
+
+        result = minimax_sparse_decode(
             q,
             None,
             k_cache,
@@ -621,7 +645,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             disable_index_value=disable_value,
             page_size=self.page_size,
             use_msa=False,
+            cached_topk_idx=cached_topk_idx,
+            return_topk_idx=want_topk,
         )
+        if want_topk:
+            idx_o, o, reduced_topk_idx = result
+            self._verify_topk_cache[group] = reduced_topk_idx
+        else:
+            idx_o, o = result
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
             o.reshape(q.shape[0], -1).contiguous(),
