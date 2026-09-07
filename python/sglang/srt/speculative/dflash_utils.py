@@ -54,6 +54,19 @@ elif is_hip():
         top_p_renorm_probs_triton as top_p_renorm_prob,
     )
 
+    # sgl_kernel.tree_speculative_sampling_target_only is CUDA-only. Its source
+    # csrc/speculative/speculative_sampling.cu is absent from setup_rocm.py's
+    # build list and csrc/common_extension_rocm.cc registers no such operator,
+    # so importing the Python wrapper succeeds while calling it raises
+    # "AttributeError: '_OpNamespace' 'sgl_kernel' object has no attribute
+    # tree_speculative_sampling_target_only" and kills every TP rank on the
+    # first temperature>0 request. DFlash proposals are a linear chain, so the
+    # chain-specialised Triton verifier is used instead; it keeps the operator's
+    # keyword signature.
+    from sglang.kernels.ops.speculative.dflash_chain_sampling import (
+        chain_speculative_sampling_target_only as tree_speculative_sampling_target_only,
+    )
+
     _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
 else:
     top_k_renorm_prob = None
