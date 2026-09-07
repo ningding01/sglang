@@ -20,6 +20,7 @@ DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 logger = logging.getLogger(__name__)
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
+_DFLASH_FUSED_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
@@ -66,6 +67,22 @@ elif is_hip():
     from sglang.kernels.ops.speculative.dflash_chain_sampling import (
         chain_speculative_sampling_target_only as tree_speculative_sampling_target_only,
     )
+
+    # Fused fast path. The chain verifier above is correct but pays for a
+    # vocab-sized dense target_probs/draft_probs pair and three host syncs per
+    # step; the fused kernel does the same work on the k-sized top-k support
+    # with no sync. It declines batches it does not cover (no top-k, top_k too
+    # large), which then fall through to the path above.
+    try:
+        from sglang.kernels.ops.speculative.dflash_fused_sampling import (
+            can_use_fused,
+            fused_dflash_sampling_verify,
+        )
+
+        _DFLASH_FUSED_AVAILABLE = True
+    except Exception as _e:  # pragma: no cover
+        logger.warning("DFLASH fused verify unavailable: %s", _e)
+        _DFLASH_FUSED_AVAILABLE = False
 
     _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
 else:
@@ -731,6 +748,24 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         uniform_samples_for_final_sampling = uniform_samples_for_final_sampling.to(
             device=device,
             dtype=torch.float32,
+        )
+
+    if _DFLASH_FUSED_AVAILABLE and can_use_fused(
+        sampling_info=sampling_info,
+        max_top_k=max_top_k,
+        vocab_size=int(next_token_logits.shape[-1]),
+        draft_token_num=draft_token_num,
+        use_sparse_topk=use_sparse_topk,
+    ):
+        return fused_dflash_sampling_verify(
+            candidates=candidates,
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            max_top_k=int(max_top_k),
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
         )
 
     target_probs = build_dflash_verify_target_probs(
